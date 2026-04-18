@@ -14,7 +14,10 @@ from typing import Any, Dict
 
 import streamlit as st
 
-from autoPPA.AutoPPA.model11 import app as model11_app
+try:
+    from autoPPA.AutoPPA.model11 import app as model11_app
+except Exception:
+    from model11 import app as model11_app
 
 
 def _sanitize_text(value: Any) -> str:
