@@ -159,6 +159,7 @@ class AutoPPA(TypedDict, total=False):
     continue_loop: bool
     continue_reason: str
     combined_circuit: str
+    fix_attempts: int
 
 
 DEVICE_RE = re.compile(r"^[RCLDVIQMBX]\w*", re.IGNORECASE)
@@ -249,6 +250,44 @@ def _extract_ngspice_error_line(log: str) -> Optional[str]:
         if any(k in l for k in ("error", "fatal", "unknown", "failed")):
             return line.strip()
     return None
+
+
+def _extract_defined_models(netlist: str) -> Set[str]:
+    models: Set[str] = set()
+    for line in (netlist or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"(?i)^\.model\s+(\S+)\s+", s)
+        if m:
+            models.add(m.group(1).lower())
+    return models
+
+
+def _inject_fallback_models(netlist: str, missing_model_names: List[str]) -> Tuple[str, List[str]]:
+    if not missing_model_names:
+        return netlist, []
+
+    fallback_cards = {
+        "nmos": ".model nmos nmos level=1 vto=0.5 kp=120e-6 gamma=0.4 phi=0.7 lambda=0.02",
+        "pmos": ".model pmos pmos level=1 vto=-0.5 kp=50e-6 gamma=0.4 phi=0.7 lambda=0.02",
+    }
+    existing = _extract_defined_models(netlist)
+    to_add: List[str] = []
+    added_names: List[str] = []
+
+    for name in missing_model_names:
+        key = (name or "").strip().lower()
+        if key in fallback_cards and key not in existing:
+            to_add.append(fallback_cards[key])
+            added_names.append(key)
+            existing.add(key)
+
+    if not to_add:
+        return netlist, []
+
+    prefix = "* AutoPPA fallback models for missing MOS definitions\n"
+    return f"{prefix}" + "\n".join(to_add) + "\n" + netlist, added_names
 
 
 def _call_llm(messages: List[Dict[str, str]], max_tokens: int = 2200) -> str:
@@ -636,6 +675,14 @@ def _analyze_simulation_errors(log: str) -> Dict[str, Any]:
     }
     if "too few parameters" in log_l or "parameter mismatch" in log_l:
         analysis.update(error_type="subcircuit_port_mismatch", severity="high", fix_strategy="fix_ports")
+    elif "could not find a valid modelname" in log_l or "unknown model" in log_l:
+        missing = sorted({m.lower() for m in re.findall(r"\b([np]mos)\b", log_l, flags=re.IGNORECASE)})
+        analysis.update(
+            error_type="missing_model",
+            severity="high",
+            fix_strategy="add_default_models",
+            details={"missing_models": missing},
+        )
     elif "unknown subckt" in log_l or ("unknown" in log_l and "subcircuit" in log_l):
         analysis.update(error_type="missing_subcircuit", severity="high", fix_strategy="reject")
     elif "no such vector" in log_l or "vector not found" in log_l:
@@ -664,6 +711,12 @@ def _apply_fixes(netlist: str, testbench: str, error_analysis: Dict[str, Any], s
         if not re.search(r"(?im)^\s*\.options\s+.*gmin", netlist_out):
             netlist_out = ".options gmin=1e-12 reltol=1e-3\n" + netlist_out
             fixes.append("Added conservative .options for convergence")
+
+    if err == "missing_model":
+        missing_models = error_analysis.get("details", {}).get("missing_models", [])
+        netlist_out, added = _inject_fallback_models(netlist_out, missing_models)
+        if added:
+            fixes.append(f"Injected fallback .model cards for: {', '.join(sorted(added))}")
 
     return netlist_out, tb_out, fixes
 
@@ -772,6 +825,7 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "baseline_area": float("inf"),
         "continue_loop": True,
         "continue_reason": "init",
+        "fix_attempts": 0,
     }
 
 
@@ -833,6 +887,7 @@ def llm_design_generator(state: AutoPPA) -> Dict[str, Any]:
             "reasoning": "Baseline iteration: using original netlist for reference metrics.",
             "targets": {"delay_target_ps": 100.0, "power_target_uw": 200.0},
             "area_um2": _estimate_area_from_netlist(current_netlist),
+            "fix_attempts": 0,
             "testbench": state.get("testbench") or _generate_testbench(
                 current_netlist, state.get("analysis_type", "Transient"), structure
             ),
@@ -898,6 +953,7 @@ Return ONLY JSON:
         "reasoning": parsed.get("reasoning", "Applied safe optimization constraints."),
         "targets": parsed.get("targets", {"delay_target_ps": 100.0, "power_target_uw": 200.0}),
         "area_um2": _estimate_area_from_netlist(candidate),
+        "fix_attempts": 0,
     }
 
 
@@ -931,6 +987,7 @@ def deterministic_fixer(state: AutoPPA) -> Dict[str, Any]:
         "testbench": fixed_tb,
         "applied_fixes": fixes,
         "fix_history": state.get("fix_history", []) + fixes,
+        "fix_attempts": int(state.get("fix_attempts", 0)) + 1,
     }
 
 
@@ -1172,7 +1229,8 @@ def route_after_functional(state: AutoPPA) -> str:
 
 def route_after_simulation(state: AutoPPA) -> str:
     if state.get("sim_failed", True):
-        if state.get("sim_error_pattern") in {"invalid_measure_node", "convergence"}:
+        fix_attempts = int(state.get("fix_attempts", 0))
+        if state.get("sim_error_pattern") in {"invalid_measure_node", "convergence", "missing_model"} and fix_attempts < 2:
             return "fixable"
         return "failed"
     return "success"
