@@ -159,6 +159,7 @@ class AutoPPA(TypedDict, total=False):
     continue_loop: bool
     continue_reason: str
     combined_circuit: str
+    fix_attempts: int
 
 
 DEVICE_RE = re.compile(r"^[RCLDVIQMBX]\w*", re.IGNORECASE)
@@ -772,6 +773,7 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "baseline_area": float("inf"),
         "continue_loop": True,
         "continue_reason": "init",
+        "fix_attempts": 0,
     }
 
 
@@ -833,6 +835,7 @@ def llm_design_generator(state: AutoPPA) -> Dict[str, Any]:
             "reasoning": "Baseline iteration: using original netlist for reference metrics.",
             "targets": {"delay_target_ps": 100.0, "power_target_uw": 200.0},
             "area_um2": _estimate_area_from_netlist(current_netlist),
+            "fix_attempts": 0,
             "testbench": state.get("testbench") or _generate_testbench(
                 current_netlist, state.get("analysis_type", "Transient"), structure
             ),
@@ -898,6 +901,7 @@ Return ONLY JSON:
         "reasoning": parsed.get("reasoning", "Applied safe optimization constraints."),
         "targets": parsed.get("targets", {"delay_target_ps": 100.0, "power_target_uw": 200.0}),
         "area_um2": _estimate_area_from_netlist(candidate),
+        "fix_attempts": 0,
     }
 
 
@@ -931,6 +935,7 @@ def deterministic_fixer(state: AutoPPA) -> Dict[str, Any]:
         "testbench": fixed_tb,
         "applied_fixes": fixes,
         "fix_history": state.get("fix_history", []) + fixes,
+        "fix_attempts": int(state.get("fix_attempts", 0)) + 1,
     }
 
 
@@ -1172,7 +1177,8 @@ def route_after_functional(state: AutoPPA) -> str:
 
 def route_after_simulation(state: AutoPPA) -> str:
     if state.get("sim_failed", True):
-        if state.get("sim_error_pattern") in {"invalid_measure_node", "convergence"}:
+        fix_attempts = int(state.get("fix_attempts", 0))
+        if state.get("sim_error_pattern") in {"invalid_measure_node", "convergence"} and fix_attempts < 2:
             return "fixable"
         return "failed"
     return "success"
