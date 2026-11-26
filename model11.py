@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 from collections import deque
 from pathlib import Path
+from math import isfinite
 from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 from dotenv import load_dotenv
@@ -160,6 +161,14 @@ class AutoPPA(TypedDict, total=False):
     continue_reason: str
     combined_circuit: str
     fix_attempts: int
+    area_estimate_um2: float
+    area_estimate_method: str
+    area_is_physical: bool
+    llm_error: str
+    llm_status: str
+    measurement_error: str
+    functional_validation_level: str
+    validation_warnings: list
 
 
 DEVICE_RE = re.compile(r"^[RCLDVIQMBX]\w*", re.IGNORECASE)
@@ -268,10 +277,9 @@ def _inject_fallback_models(netlist: str, missing_model_names: List[str]) -> Tup
     if not missing_model_names:
         return netlist, []
 
-    fallback_cards = {
-        "nmos": ".model nmos nmos level=1 vto=0.5 kp=120e-6 gamma=0.4 phi=0.7 lambda=0.02",
-        "pmos": ".model pmos pmos level=1 vto=-0.5 kp=50e-6 gamma=0.4 phi=0.7 lambda=0.02",
-    }
+    # Do not silently substitute generic MOS models: they invalidate PPA fidelity.
+    return netlist, []
+    
     existing = _extract_defined_models(netlist)
     to_add: List[str] = []
     added_names: List[str] = []
@@ -291,12 +299,14 @@ def _inject_fallback_models(netlist: str, missing_model_names: List[str]) -> Tup
 
 
 def _call_llm(messages: List[Dict[str, str]], max_tokens: int = 2200) -> str:
+    """Return an empty string on provider failure; callers must treat this as failure."""
     try:
         resp = client.chat_completion(messages=messages, max_tokens=max_tokens)
-        return (resp.choices[0].message.content or "{}").strip()
+        content = resp.choices[0].message.content
+        return content.strip() if isinstance(content, str) else ""
     except Exception as exc:
         print(f"[LLM] call failed: {exc}")
-        return "{}"
+        return ""
 
 
 def _parse_subckt_ports(netlist: str) -> Dict[str, List[str]]:
@@ -407,20 +417,27 @@ def _analyze_circuit_structure(netlist: str) -> Dict[str, Any]:
 
 
 def _build_node_graph(netlist: str) -> Dict[str, Set[str]]:
+    """
+    Build only a passive/source connectivity graph.
+
+    A MOSFET's gate is a control terminal, not a conductive drain-source edge;
+    treating all MOS terminals as one undirected component creates false paths.
+    This graph is therefore a coarse topology aid, never proof of functionality.
+    """
     graph: Dict[str, Set[str]] = {}
     for raw in netlist.splitlines():
         s = raw.strip()
-        if not s or s.startswith("*") or s.startswith("."):
+        if not s or s.startswith(("*", ".")):
             continue
         tokens = s.split()
-        nodes = _element_nodes(tokens)
-        if len(nodes) < 2:
+        if not tokens:
             continue
-        # Build conservative undirected node graph through each device terminals.
-        for i, a in enumerate(nodes):
-            for b in nodes[i + 1 :]:
-                graph.setdefault(a, set()).add(b)
-                graph.setdefault(b, set()).add(a)
+        kind = tokens[0][0].upper()
+        if kind in ("R", "C", "L", "V", "I") and len(tokens) >= 3:
+            a, b = tokens[1], tokens[2]
+            graph.setdefault(a, set()).add(b)
+            graph.setdefault(b, set()).add(a)
+        # D/BJT/MOS/subcircuit behavior is not represented as a simple wire.
     return graph
 
 
@@ -486,11 +503,22 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
 
     inputs = sorted(structure.get("inputs", set()))
     graph = _build_node_graph(netlist)
+    # A passive-only graph cannot establish active transistor functionality.
+    # Preserve the diagnostic, but never promote a coarse graph path to proof.
     path_exists = any(_has_path(graph, i, o) for i in inputs for o in outputs) if inputs and outputs else False
     result["path_exists"] = path_exists
-    if not path_exists:
+    result["validation_level"] = "structural_only"
+    result["warnings"] = [
+        "Static connectivity checks do not prove transistor-level logical equivalence.",
+        "Run NGSpice with explicit, circuit-specific stimulus and compare against a golden response."
+    ]
+    if not inputs or not outputs:
         result["valid"] = False
-        result["errors"].append("No path from any inferred input to any inferred output")
+        result["errors"].append("Unable to infer circuit inputs and outputs; explicit testbench required")
+    elif not path_exists:
+        # Passive connectivity is not expected to connect a driven input to an
+        # output through MOS devices, so this is a warning, not proof of failure.
+        result["warnings"].append("No passive-only input-to-output path detected; active device behavior requires simulation.")
 
     # Measurement node existence validation.
     measure_nodes = _extract_measure_nodes(testbench)
@@ -593,6 +621,12 @@ def _generate_testbench(netlist: str, analysis_type: str, structure: Dict[str, A
     primary_output = outputs[0]
 
     lines = ["* Auto-generated Testbench"]
+    raise ValueError(
+        "Automatic testbench generation requires explicit circuit-specific supply, "
+        "input vectors, load, and measurement thresholds. Provide a reviewed testbench "
+        "instead of relying on guessed 1.8 V / 10 fF defaults."
+    )
+
     lines.append(f"VDD {power_node} 0 DC 1.8")
 
     # Drive all inferred inputs; use one toggling source and bias others.
@@ -721,30 +755,42 @@ def _apply_fixes(netlist: str, testbench: str, error_analysis: Dict[str, Any], s
     return netlist_out, tb_out, fixes
 
 
-def _estimate_area_from_netlist(netlist: str) -> float:
-    area = 0.0
+def _parse_spice_number(raw: str) -> Optional[float]:
+    """Parse common SPICE numeric suffixes into SI values."""
+    match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)\s*([a-z]+)?\s*", raw, re.I)
+    if not match:
+        return None
+    value = float(match.group(1))
+    suffix = (match.group(2) or "").lower()
+    scale = {
+        "": 1.0, "t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3,
+        "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "f": 1e-15,
+    }.get(suffix)
+    return value * scale if scale is not None else None
+
+
+def _estimate_area_from_netlist(netlist: str) -> Optional[float]:
+    """Return sum(W*L) in square metres as a sizing proxy, not physical area."""
+    area_m2 = 0.0
+    found_mos = False
     for line in netlist.splitlines():
         s = line.strip()
-        if not s or s.startswith("*"):
+        if not s or s.startswith(("*", ".")):
             continue
         parts = s.split()
-        if not parts or parts[0][0].upper() != "M":
+        if not parts or not MOS_RE.match(parts[0]):
             continue
-        w_val = 1.0
-        l_val = 1.0
-        for token in parts:
-            if token.lower().startswith("w="):
-                try:
-                    w_val = float(re.sub(r"[^0-9eE+\-.]", "", token[2:]) or "1")
-                except ValueError:
-                    w_val = 1.0
-            elif token.lower().startswith("l="):
-                try:
-                    l_val = float(re.sub(r"[^0-9eE+\-.]", "", token[2:]) or "1")
-                except ValueError:
-                    l_val = 1.0
-        area += abs(w_val * l_val)
-    return round(area, 4)
+        found_mos = True
+        params = {p.split("=", 1)[0].lower(): p.split("=", 1)[1]
+                  for p in parts[5:] if "=" in p}
+        w = _parse_spice_number(params.get("w", ""))
+        l = _parse_spice_number(params.get("l", ""))
+        if w is None or l is None or w <= 0 or l <= 0:
+            return None
+        area_m2 += w * l
+    if not found_mos:
+        return None
+    return round(area_m2 * 1e12, 6)  # square micrometres (proxy)
 
 
 def _parse_measures_from_log(log: str) -> Tuple[float, float]:
@@ -795,6 +841,13 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
     if not raw:
         raise ValueError("SPICE netlist is empty.")
 
+    explicit_tb = state.get("testbench", "")
+    if not isinstance(explicit_tb, str) or not explicit_tb.strip():
+        raise ValueError(
+            "A circuit-specific testbench is required. Supply explicit power rails, "
+            "input stimulus, output load, and measurement directives."
+        )
+
     cleaned = _strip_comments(_sanitize_spice_text(raw))
     return {
         "netlist_raw": raw,
@@ -826,6 +879,15 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "continue_loop": True,
         "continue_reason": "init",
         "fix_attempts": 0,
+        "testbench": explicit_tb,
+        "area_estimate_um2": _estimate_area_from_netlist(cleaned),
+        "area_estimate_method": "sum(W*L) proxy; not physical layout area",
+        "area_is_physical": False,
+        "functional_validation_level": "simulation_required",
+        "validation_warnings": [
+            "Static topology checks cannot prove logic equivalence.",
+            "Physical area requires synthesis/layout data; W*L is only a sizing proxy."
+        ],
     }
 
 
@@ -936,17 +998,32 @@ Return ONLY JSON:
         ],
         max_tokens=3200,
     )
-    parsed = _extract_json(raw) or {}
+    parsed = _extract_json(raw)
+    if not raw or not isinstance(parsed, dict) or not isinstance(parsed.get("proposed_netlist"), str):
+        return {
+            "proposed_netlist": current_netlist,
+            "reasoning": "LLM generation failed or returned invalid JSON; candidate rejected.",
+            "llm_status": "error",
+            "llm_error": "Empty response or missing proposed_netlist",
+            "candidate_unchanged": True,
+            "fix_attempts": 0,
+        }
 
-    candidate = _decode_escaped_text(parsed.get("proposed_netlist", "")) or current_netlist
+    candidate = _decode_escaped_text(parsed.get("proposed_netlist", ""))
     candidate = _strip_comments(candidate)
     candidate = _sanitize_spice_text(candidate)
 
-    if not candidate.strip():
-        candidate = current_netlist
+    if not candidate.strip() or candidate == current_netlist:
+        return {
+            "proposed_netlist": current_netlist,
+            "reasoning": "LLM did not produce a changed candidate; no-op rejected.",
+            "llm_status": "no_change",
+            "llm_error": "Candidate is empty or unchanged",
+            "candidate_unchanged": True,
+            "fix_attempts": 0,
+        }
 
-    testbench = _generate_testbench(candidate, state.get("analysis_type", "Transient"), _analyze_circuit_structure(candidate))
-
+    testbench = state.get("testbench", "")
     return {
         "proposed_netlist": candidate,
         "testbench": testbench,
@@ -954,6 +1031,12 @@ Return ONLY JSON:
         "targets": parsed.get("targets", {"delay_target_ps": 100.0, "power_target_uw": 200.0}),
         "area_um2": _estimate_area_from_netlist(candidate),
         "fix_attempts": 0,
+        "llm_status": "ok",
+        "llm_error": "",
+        "candidate_unchanged": False,
+        "area_estimate_um2": _estimate_area_from_netlist(candidate),
+        "area_estimate_method": "sum(W*L) proxy; not physical layout area",
+        "area_is_physical": False,
     }
 
 
@@ -961,6 +1044,8 @@ def simulation_runner(state: AutoPPA) -> Dict[str, Any]:
     netlist = state.get("proposed_netlist") or state.get("working_netlist", "")
     structure = state.get("circuit_structure") or _analyze_circuit_structure(netlist)
     testbench = state.get("testbench") or _generate_testbench(netlist, state.get("analysis_type", "Transient"), structure)
+    if not testbench.strip():
+        raise ValueError("Missing explicit circuit-specific testbench.")
     result = _run_ngspice_combined(netlist, testbench)
     return {
         "ngspice_log": result["log"],
@@ -1010,8 +1095,15 @@ def llm_parse_results(state: AutoPPA) -> Dict[str, Any]:
         delay = float(parsed.get("delay_ps", float("inf")) or float("inf"))
         power = float(parsed.get("power_uw", float("inf")) or float("inf"))
 
-    area = state.get("area_um2", 0.0) or _estimate_area_from_netlist(state.get("proposed_netlist", ""))
-    return {"delay_ps": delay, "power_uw": power, "area_um2": area}
+    area = _estimate_area_from_netlist(state.get("proposed_netlist", ""))
+    return {
+        "delay_ps": delay,
+        "power_uw": power,
+        "area_um2": area if area is not None else float("inf"),
+        "area_estimate_um2": area,
+        "area_estimate_method": "sum(W*L) proxy; not physical layout area",
+        "area_is_physical": False,
+    }
 
 
 def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
@@ -1020,7 +1112,9 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
     current_area = state.get("area_um2", float("inf"))
 
     sim_ok = not state.get("sim_failed", True)
-    func_ok = bool(state.get("functional_valid", False))
+    # Simulation with a user-supplied golden testbench is required. Static
+    # connectivity checks are not a functional-equivalence proof.
+    func_ok = bool(state.get("functional_valid", False)) and bool(state.get("golden_validation_passed", False))
 
     best_delay = state.get("best_delay", float("inf"))
     best_power = state.get("best_power", float("inf"))
@@ -1036,21 +1130,33 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
 
     improved_any = False
     if sim_ok and func_ok:
-        if best_delay == float("inf") and best_power == float("inf"):
-            improved_any = True  # baseline acceptance
+        objective = (state.get("opt_objective") or "Balanced PPA").lower()
+        delay_ok = isfinite(float(current_delay))
+        power_ok = isfinite(float(current_power))
+        area_ok = isfinite(float(current_area))
+        if not (delay_ok and power_ok):
+            reject_reasons.append("delay/power measurements unavailable")
+        elif best_delay == float("inf") and best_power == float("inf"):
+            improved_any = True  # baseline only after verified simulation + golden checks
         else:
-            delay_imp = current_delay < best_delay
-            power_imp = current_power < best_power
-            area_imp = current_area < best_area
-            improved_any = delay_imp or power_imp or area_imp
+            # Objective-aware acceptance: primary metric must improve; other
+            # measured metrics may not regress beyond a small explicit tolerance.
+            tolerance = float(state.get("regression_tolerance", 0.02))
+            if "delay" in objective or "performance" in objective:
+                improved_any = current_delay < best_delay and current_power <= best_power * (1 + tolerance)
+            elif "power" in objective:
+                improved_any = current_power < best_power and current_delay <= best_delay * (1 + tolerance)
+            elif "area" in objective:
+                improved_any = area_ok and current_area < best_area and current_delay <= best_delay * (1 + tolerance) and current_power <= best_power * (1 + tolerance)
+            else:
+                # Balanced: require Pareto dominance (no metric worsens, at least
+                # one improves). If area unavailable, compare delay and power.
+                compared = [(current_delay, best_delay), (current_power, best_power)]
+                if area_ok and isfinite(float(best_area)):
+                    compared.append((current_area, best_area))
+                improved_any = all(c <= b * (1 + tolerance) for c, b in compared) and any(c < b for c, b in compared)
             if not improved_any:
-                reject_reasons.append("no PPA metric improved")
-
-        # Strong rejection logic: reject if all worse or unclear metrics.
-        unclear_metrics = current_delay == float("inf") or current_power == float("inf")
-        if unclear_metrics:
-            reject_reasons.append("metrics unavailable/unclear")
-            improved_any = False
+                reject_reasons.append("candidate does not satisfy objective-aware non-regression criteria")
 
     accepted = sim_ok and func_ok and improved_any and not reject_reasons
 
@@ -1097,9 +1203,10 @@ def cost_tracker(state: AutoPPA) -> Dict[str, Any]:
     dt = max(float(targets.get("delay_target_ps", 100.0)), 1e-9)
     pt = max(float(targets.get("power_target_uw", 200.0)), 1e-9)
 
-    d_score = (delay / dt) if delay < float("inf") else 999.0
-    p_score = (power / pt) if power < float("inf") else 999.0
-    a_score = area if area < float("inf") else 999.0
+    d_score = (delay / dt) if isfinite(float(delay)) else 999.0
+    p_score = (power / pt) if isfinite(float(power)) else 999.0
+    a_score = (area / max(float(state.get("area_target_um2", 1.0)), 1e-12)
+               if isfinite(float(area)) else 999.0)
 
     w_d, w_p, w_a = _objective_weights(state.get("opt_objective", "Balanced PPA"))
     cost = w_d * d_score + w_p * p_score + w_a * a_score
@@ -1220,6 +1327,9 @@ def final_optimizer(state: AutoPPA) -> Dict[str, Any]:
         "final_power": state.get("best_power"),
         "final_area": state.get("best_area"),
         "convergence_score": state.get("cost", 0.0),
+        "area_is_physical": False,
+        "area_estimate_um2": state.get("area_estimate_um2"),
+        "area_estimate_method": state.get("area_estimate_method", "unknown"),
     }
 
 
