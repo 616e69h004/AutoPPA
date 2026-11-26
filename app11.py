@@ -46,7 +46,11 @@ def _save_results(output_file: Path, results: Dict[str, Any]) -> None:
         "analysis_type": _sanitize_text(results.get("analysis_type", "")),
         "best_delay_ps": results.get("best_delay"),
         "best_power_uw": results.get("best_power"),
-        "best_area_um2": results.get("best_area"),
+        "best_area_estimate_um2": results.get("area_estimate_um2", results.get("best_area")),
+        "area_estimate_method": results.get("area_estimate_method", "unknown"),
+        "area_is_physical": results.get("area_is_physical", False),
+        "golden_validation": _sanitize_result(results.get("golden_validation", {})),
+        "golden_validation_passed": results.get("golden_validation_passed", False),
         "min_cost": results.get("min_cost"),
         "convergence_score": results.get("convergence_score"),
         "optimised_netlist": _sanitize_text(results.get("optimised_netlist", "")),
@@ -87,6 +91,8 @@ def run_model11(
     analysis_type: str,
     opt_objective: str,
     max_iterations: int,
+    testbench: str,
+    golden_expectations: Dict[str, float],
 ) -> Dict[str, Any]:
     result = model11_app.invoke({
         "netlist_raw": netlist,
@@ -98,6 +104,8 @@ def run_model11(
         "analysis_type": analysis_type,
         "opt_objective": opt_objective,
         "max_iterations": max_iterations,
+        "testbench": testbench,
+        "golden_expectations": golden_expectations,
     })
     return _sanitize_result(result)
 
@@ -125,8 +133,9 @@ def main() -> None:
 
         analysis_type = st.selectbox(
             "Analysis Type",
-            ["Transient", "AC Analysis", "DC Analysis", "Operating Point"],
+            ["Transient"],
             index=0,
+            help="The current optimizer requires transient delay/power measurements and golden output checkpoints.",
         )
 
         opt_objective = st.selectbox(
@@ -188,10 +197,55 @@ def main() -> None:
         help="Optional description used when the optimizer needs more design intent.",
     )
 
+    st.subheader("🧪 Verification Testbench")
+    st.caption(
+        "Provide a circuit-specific NGSpice testbench. It must contain delay_val, avg_pwr, "
+        "and one or more golden_* measurements that check expected output behavior."
+    )
+    testbench = st.text_area(
+        "SPICE testbench",
+        height=260,
+        placeholder=(
+            "* Example structure only — adapt it to your circuit and technology\n"
+            "VDD vdd 0 DC 1.8\n"
+            "VIN in 0 PULSE(0 1.8 0 10p 10p 500p 1n)\n"
+            ".tran 1p 2n\n"
+            ".measure tran delay_val TRIG v(in) VAL=0.9 RISE=1 TARG v(out) VAL=0.9 FALL=1\n"
+            ".measure tran avg_pwr AVG par('-v(vdd)*i(VDD)') FROM=0 TO=2n\n"
+            ".measure tran golden_out_high FIND v(out) AT=1.5n\n"
+            ".measure tran golden_out_low FIND v(out) AT=0.5n\n"
+            ".end"
+        ),
+    )
+    golden_expectations_text = st.text_area(
+        "Golden expected measurements (JSON)",
+        height=100,
+        placeholder='{"golden_out_high": 1.8, "golden_out_low": 0.0}',
+        help=(
+            "Expected numeric values from the golden/reference circuit for each golden_* "
+            "measurement. Use the same units as NGSpice reports."
+        ),
+    )
+
     if st.button("🚀 Run model11 Optimization", type="primary"):
         if not netlist.strip():
             st.error("Please provide a valid SPICE netlist before running.")
+        elif not testbench.strip():
+            st.error("Please provide a circuit-specific SPICE testbench.")
         else:
+            try:
+                golden_expectations = json.loads(golden_expectations_text)
+                if not isinstance(golden_expectations, dict) or not golden_expectations:
+                    raise ValueError("Expected a non-empty JSON object.")
+                if any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    for value in golden_expectations.values()
+                ):
+                    raise ValueError("All golden expected values must be numeric.")
+            except (json.JSONDecodeError, ValueError) as exc:
+                st.error(f"Invalid golden measurement JSON: {exc}")
+                return
+
             with st.spinner("Running model11 closed-loop optimization... please wait"):
                 try:
                     result = run_model11(
@@ -202,6 +256,8 @@ def main() -> None:
                         analysis_type=analysis_type,
                         opt_objective=opt_objective,
                         max_iterations=max_iterations,
+                        testbench=testbench,
+                        golden_expectations=golden_expectations,
                     )
                     st.session_state["model11_result"] = result
                 except Exception as exc:
@@ -223,7 +279,8 @@ def main() -> None:
         cols[3].metric("Power (uW)", _format_metric(result.get("best_power")))
 
         cols = st.columns(4)
-        cols[0].metric("Area (um²)", _format_metric(result.get("best_area")))
+        cols[0].metric("Area proxy (um²)", _format_metric(result.get("best_area")))
+        cols[0].caption("Sum(W×L); not physical layout area")
         cols[1].metric("Cost", _format_metric(result.get("min_cost")))
         cols[2].metric("Convergence", _format_metric(result.get("convergence_score")))
         cols[3].metric("Circuit Type", result.get("circuit_type", ""))
@@ -237,6 +294,15 @@ def main() -> None:
         vcols[0].metric("Structural", "✅ Valid" if structural_ok else "❌ Issues")
         vcols[1].metric("Electrical", "✅ Valid" if electrical_ok else "❌ Issues")
         vcols[2].metric("Functional", "✅ Valid" if functional_ok else "❌ Issues")
+
+        golden_result = result.get("golden_validation", {})
+        st.metric(
+            "Golden-response verification",
+            "✅ Passed" if result.get("golden_validation_passed") else "❌ Not passed",
+        )
+        if golden_result:
+            with st.expander("Golden measurement comparison", expanded=True):
+                st.json(golden_result)
 
         if result.get("met_details"):
             with st.expander("Constraint Status", expanded=True):
