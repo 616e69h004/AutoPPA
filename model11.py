@@ -253,8 +253,10 @@ def _objective_weights(obj: str) -> Tuple[float, float, float]:
     if "power" in s:
         return (0.20, 0.70, 0.10)
     if "area" in s:
-        return (0.20, 0.20, 0.60)
-    return (0.40, 0.40, 0.20)
+        # This engine has no physical layout area backend. Do not optimize a
+        # W*L sizing proxy as though it were physical area.
+        return (0.0, 0.0, 1.0)
+    return (0.50, 0.50, 0.0)
 
 
 def _extract_ngspice_error_line(log: str) -> Optional[str]:
@@ -778,10 +780,20 @@ def _parse_spice_number(raw: str) -> Optional[float]:
         return None
     value = float(match.group(1))
     suffix = (match.group(2) or "").lower()
-    scale = {
+    # Common PDK netlists append length units (e.g. 0.18um). Treat these as
+    # annotations after the SPICE scale prefix.
+    scales = {
         "": 1.0, "t": 1e12, "g": 1e9, "meg": 1e6, "k": 1e3,
         "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12, "f": 1e-15,
-    }.get(suffix)
+        "mm": 1e-3, "um": 1e-6, "nm": 1e-9, "pm": 1e-12,
+        "micron": 1e-6, "microns": 1e-6,
+    }
+    scale = scales.get(suffix)
+    if scale is None:
+        for prefix in ("meg", "t", "g", "k", "m", "u", "n", "p", "f"):
+            if suffix.startswith(prefix):
+                scale = scales[prefix]
+                break
     return value * scale if scale is not None else None
 
 
@@ -933,9 +945,9 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
             "Provide golden_expectations as a non-empty JSON object, for example "
             '{"golden_out_high": 1.8, "golden_out_low": 0.0}.'
         )
-    if not re.search(r"(?im)^\\s*\\.meas(?:ure)?\\s+\\S+\\s+delay_val\\b", explicit_tb):
+    if not re.search(r"(?im)^\s*\.meas(?:ure)?\s+\S+\s+delay_val\b", explicit_tb):
         raise ValueError("Testbench must define .measure delay_val for delay extraction.")
-    if not re.search(r"(?im)^\\s*\\.meas(?:ure)?\\s+\\S+\\s+avg_pwr\\b", explicit_tb):
+    if not re.search(r"(?im)^\s*\.meas(?:ure)?\s+\S+\s+avg_pwr\b", explicit_tb):
         raise ValueError("Testbench must define .measure avg_pwr for power extraction.")
     declared_golden = {
         m.group(1).lower()
@@ -1244,9 +1256,6 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
         bool(state.get("functional_valid", False))
         and bool(state.get("golden_validation_passed", False))
     )
-    if not state.get("golden_validation_passed", False):
-        reject_reasons_placeholder = None
-
     best_delay = state.get("best_delay", float("inf"))
     best_power = state.get("best_power", float("inf"))
     best_area = state.get("best_area", float("inf"))
@@ -1336,8 +1345,12 @@ def cost_tracker(state: AutoPPA) -> Dict[str, Any]:
 
     d_score = (delay / dt) if isfinite(float(delay)) else 999.0
     p_score = (power / pt) if isfinite(float(power)) else 999.0
-    a_score = (area / max(float(state.get("area_target_um2", 1.0)), 1e-12)
-               if isfinite(float(area)) else 999.0)
+    # Area is a clearly labelled W*L proxy until a synthesis/layout flow is
+    # connected. Keep it out of the PPA objective and cost by default.
+    a_score = 0.0 if not state.get("area_is_physical", False) else (
+        area / max(float(state.get("area_target_um2", 1.0)), 1e-12)
+        if isfinite(float(area)) else 999.0
+    )
 
     w_d, w_p, w_a = _objective_weights(state.get("opt_objective", "Balanced PPA"))
     cost = w_d * d_score + w_p * p_score + w_a * a_score
