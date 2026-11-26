@@ -1267,6 +1267,8 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
         area_ok = isfinite(float(current_area))
         if not (delay_ok and power_ok):
             reject_reasons.append("delay/power measurements unavailable")
+        elif "area" in objective and not state.get("area_is_physical", False):
+            improved_any = False
         elif best_delay == float("inf") and best_power == float("inf"):
             improved_any = True  # baseline only after verified simulation + golden checks
         else:
