@@ -280,28 +280,8 @@ def _extract_defined_models(netlist: str) -> Set[str]:
 
 
 def _inject_fallback_models(netlist: str, missing_model_names: List[str]) -> Tuple[str, List[str]]:
-    if not missing_model_names:
-        return netlist, []
-
-    # Do not silently substitute generic MOS models: they invalidate PPA fidelity.
+    """Do not fabricate process models; require the correct PDK model library."""
     return netlist, []
-    
-    existing = _extract_defined_models(netlist)
-    to_add: List[str] = []
-    added_names: List[str] = []
-
-    for name in missing_model_names:
-        key = (name or "").strip().lower()
-        if key in fallback_cards and key not in existing:
-            to_add.append(fallback_cards[key])
-            added_names.append(key)
-            existing.add(key)
-
-    if not to_add:
-        return netlist, []
-
-    prefix = "* AutoPPA fallback models for missing MOS definitions\n"
-    return f"{prefix}" + "\n".join(to_add) + "\n" + netlist, added_names
 
 
 def _call_llm(messages: List[Dict[str, str]], max_tokens: int = 2200) -> str:
@@ -507,7 +487,12 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
 
     inputs = sorted(set(structure.get("inputs", set())) | tb_inputs)
     measure_nodes = _extract_measure_nodes(testbench)
-    outputs = sorted((set(structure.get("outputs", set())) | measure_nodes) - set(inputs) - {"0", "gnd"})
+    rails = {"0", "gnd", "vdd", "vss", "vcc", "vee"}
+    outputs = sorted(
+        (set(structure.get("outputs", set())) | measure_nodes)
+        - set(inputs)
+        - rails
+    )
     connectivity = structure.get("connectivity", {})
 
     # Output node is floating if no connected active driver class M/X/Q/B.
@@ -541,6 +526,11 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
 
     # Measurement node existence validation.
     all_nodes = set(structure.get("nodes", set()))
+    for raw in testbench.splitlines():
+        line = raw.strip()
+        tokens = line.split()
+        if tokens and tokens[0][0].upper() == "V" and len(tokens) >= 3:
+            all_nodes.update(tokens[1:3])
     for node in sorted(measure_nodes):
         if node not in all_nodes and node.lower() not in {"0", "gnd"}:
             result["missing_nodes"].append(node)
@@ -568,7 +558,11 @@ def _validate_electrical(netlist: str, structure: Dict[str, Any], testbench: str
                 pulse_inputs.append(parts[1])
     validation["signal_integrity"]["input_signals"] = pulse_inputs
 
-    has_supply = any(re.search(r"\bvdd\b", l, flags=re.IGNORECASE) for l in netlist.splitlines())
+    combined_text = netlist + "\n" + testbench
+    has_supply = any(
+        re.search(r"\b(vdd|vcc|vss|vee)\b", line, flags=re.IGNORECASE)
+        for line in combined_text.splitlines()
+    )
     validation["power_delivery"]["has_vdd"] = has_supply
     if not has_supply:
         validation["issues"].append("No VDD rail found")
@@ -577,6 +571,11 @@ def _validate_electrical(netlist: str, structure: Dict[str, Any], testbench: str
     mos_gates: Set[str] = set()
     potentially_driven: Set[str] = set(structure.get("inputs", set()))
     potentially_driven.update(structure.get("outputs", set()))
+    for raw in testbench.splitlines():
+        line = raw.strip()
+        tokens = line.split()
+        if tokens and tokens[0][0].upper() == "V" and len(tokens) >= 3:
+            potentially_driven.update(tokens[1:3])
 
     for line in netlist.splitlines():
         s = line.strip()
@@ -752,23 +751,15 @@ def _apply_fixes(netlist: str, testbench: str, error_analysis: Dict[str, Any], s
     tb_out = testbench
     err = error_analysis.get("error_type", "none")
 
-    if err == "invalid_measure_node":
-        nodes = sorted(structure.get("nodes", set()))
-        preferred = next((n for n in nodes if n.lower() not in {"0", "gnd", "vdd", "vss"}), None)
-        if preferred:
-            tb_out = re.sub(r"v\([^)]+\)", f"v({preferred})", tb_out, count=1, flags=re.IGNORECASE)
-            fixes.append(f"Repointed first measurement node to existing node '{preferred}'")
-
     if err == "convergence":
         if not re.search(r"(?im)^\s*\.options\s+.*gmin", netlist_out):
             netlist_out = ".options gmin=1e-12 reltol=1e-3\n" + netlist_out
-            fixes.append("Added conservative .options for convergence")
+            fixes.append("Added conservative .options for convergence; golden checks must still pass")
 
     if err == "missing_model":
-        missing_models = error_analysis.get("details", {}).get("missing_models", [])
-        netlist_out, added = _inject_fallback_models(netlist_out, missing_models)
-        if added:
-            fixes.append(f"Injected fallback .model cards for: {', '.join(sorted(added))}")
+        fixes.append("Missing process model: add the correct PDK .include/.lib; fabricated fallback models are disabled")
+    elif err == "invalid_measure_node":
+        fixes.append("Measurement node is invalid: correct the supplied testbench; automatic node substitution is disabled")
 
     return netlist_out, tb_out, fixes
 
@@ -1528,7 +1519,7 @@ graph.add_edge("simulation_runner", "error_analyzer")
 graph.add_conditional_edges(
     "error_analyzer",
     route_after_simulation,
-    {"fixable": "deterministic_fixer", "failed": "llm_design_generator", "success": "llm_parse_results"},
+    {"fixable": "deterministic_fixer", "failed": "llm_parse_results", "success": "llm_parse_results"},
 )
 
 graph.add_edge("deterministic_fixer", "simulation_runner")
