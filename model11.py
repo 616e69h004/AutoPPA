@@ -169,6 +169,10 @@ class AutoPPA(TypedDict, total=False):
     measurement_error: str
     functional_validation_level: str
     validation_warnings: list
+    golden_expectations: dict
+    golden_measurements: dict
+    golden_validation_passed: bool
+    golden_validation: dict
 
 
 DEVICE_RE = re.compile(r"^[RCLDVIQMBX]\w*", re.IGNORECASE)
@@ -487,7 +491,21 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
         result["valid"] = False
         result["errors"].append(f"Empty .subckt blocks: {result['empty_subckts']}")
 
-    outputs = sorted(structure.get("outputs", set()))
+    # Inputs should be inferred from the explicit external testbench, not only
+    # from sources embedded in the circuit netlist.
+    tb_inputs: Set[str] = set()
+    for raw in testbench.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("*", ".")):
+            continue
+        tokens = line.split()
+        if tokens and tokens[0][0].upper() == "V" and len(tokens) >= 4:
+            if any(k in line.upper() for k in ("PULSE", "SIN", "PWL")):
+                tb_inputs.add(tokens[1])
+
+    inputs = sorted(set(structure.get("inputs", set())) | tb_inputs)
+    measure_nodes = _extract_measure_nodes(testbench)
+    outputs = sorted((set(structure.get("outputs", set())) | measure_nodes) - set(inputs) - {"0", "gnd"})
     connectivity = structure.get("connectivity", {})
 
     # Output node is floating if no connected active driver class M/X/Q/B.
@@ -501,7 +519,6 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
         result["valid"] = False
         result["errors"].append(f"Floating outputs: {result['floating_outputs']}")
 
-    inputs = sorted(structure.get("inputs", set()))
     graph = _build_node_graph(netlist)
     # A passive-only graph cannot establish active transistor functionality.
     # Preserve the diagnostic, but never promote a coarse graph path to proof.
@@ -521,7 +538,6 @@ def _validate_functional(netlist: str, testbench: str, structure: Dict[str, Any]
         result["warnings"].append("No passive-only input-to-output path detected; active device behavior requires simulation.")
 
     # Measurement node existence validation.
-    measure_nodes = _extract_measure_nodes(testbench)
     all_nodes = set(structure.get("nodes", set()))
     for node in sorted(measure_nodes):
         if node not in all_nodes and node.lower() not in {"0", "gnd"}:
@@ -814,6 +830,65 @@ def _parse_measures_from_log(log: str) -> Tuple[float, float]:
     return delay_ps, power_uw
 
 
+
+
+def _parse_named_measures(log: str) -> Dict[str, float]:
+    """Extract named ngspice .measure values from batch output."""
+    values: Dict[str, float] = {}
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    for match in re.finditer(
+        rf"(?im)^\s*([A-Za-z_]\w*)\s*=\s*({number})\s*$",
+        log or "",
+    ):
+        try:
+            values[match.group(1).lower()] = float(match.group(2))
+        except ValueError:
+            continue
+    return values
+
+
+def _evaluate_golden_measurements(
+    testbench: str,
+    log: str,
+    expectations: Dict[str, Any],
+    relative_tolerance: float = 1e-3,
+    absolute_tolerance: float = 1e-6,
+) -> Dict[str, Any]:
+    """Compare explicitly named golden_* measurements against reference values."""
+    declared = {
+        m.group(1).lower()
+        for line in testbench.splitlines()
+        if (m := re.match(r"(?i)^\s*\.meas(?:ure)?\s+\S+\s+(golden_[A-Za-z0-9_]+)", line))
+    }
+    expected = {str(k).lower(): float(v) for k, v in expectations.items()}
+    missing_declarations = sorted(set(expected) - declared)
+    measured = _parse_named_measures(log)
+    missing_results = sorted(set(expected) - set(measured))
+    comparisons: Dict[str, Any] = {}
+    passed = not missing_declarations and not missing_results and bool(expected)
+    for name, reference in expected.items():
+        if name not in measured:
+            continue
+        actual = measured[name]
+        tolerance = max(absolute_tolerance, abs(reference) * relative_tolerance)
+        error = abs(actual - reference)
+        item_passed = error <= tolerance
+        comparisons[name] = {
+            "expected": reference,
+            "actual": actual,
+            "absolute_error": error,
+            "tolerance": tolerance,
+            "passed": item_passed,
+        }
+        passed = passed and item_passed
+    return {
+        "passed": passed,
+        "comparisons": comparisons,
+        "missing_measure_declarations": missing_declarations,
+        "missing_measure_results": missing_results,
+        "measurements": measured,
+    }
+
 def _improvement_summary(state: AutoPPA, current: Dict[str, float]) -> Dict[str, Any]:
     baseline_delay = state.get("baseline_delay", float("inf"))
     baseline_power = state.get("baseline_power", float("inf"))
@@ -844,14 +919,37 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
     explicit_tb = state.get("testbench", "")
     if not isinstance(explicit_tb, str) or not explicit_tb.strip():
         raise ValueError(
-            "A circuit-specific testbench is required. Supply explicit power rails, "
-            "input stimulus, output load, measurements, and a golden expected response."
+            "A circuit-specific testbench is required. Supply power rails, input stimulus, "
+            "output loads, delay_val/avg_pwr measures, and golden_* output measures."
         )
-    if not state.get("golden_validation_passed", False):
+    expectations = state.get("golden_expectations", {})
+    if isinstance(expectations, str):
+        try:
+            expectations = json.loads(expectations)
+        except json.JSONDecodeError as exc:
+            raise ValueError("golden_expectations must be valid JSON.") from exc
+    if not isinstance(expectations, dict) or not expectations:
         raise ValueError(
-            "Functional-equivalence evidence is required. Set golden_validation_passed=True "
-            "only after comparing the simulation output against a trusted golden response."
+            "Provide golden_expectations as a non-empty JSON object, for example "
+            '{"golden_out_high": 1.8, "golden_out_low": 0.0}.'
         )
+    if not re.search(r"(?im)^\\s*\\.meas(?:ure)?\\s+\\S+\\s+delay_val\\b", explicit_tb):
+        raise ValueError("Testbench must define .measure delay_val for delay extraction.")
+    if not re.search(r"(?im)^\\s*\\.meas(?:ure)?\\s+\\S+\\s+avg_pwr\\b", explicit_tb):
+        raise ValueError("Testbench must define .measure avg_pwr for power extraction.")
+    declared_golden = {
+        m.group(1).lower()
+        for line in explicit_tb.splitlines()
+        if (m := re.match(r"(?i)^\\s*\\.meas(?:ure)?\\s+\\S+\\s+(golden_[A-Za-z0-9_]+)", line))
+    }
+    expected_keys = {str(k).lower() for k in expectations}
+    if not expected_keys or expected_keys - declared_golden:
+        raise ValueError(
+            "Every golden_expectations key must have a matching .measure named golden_* "
+            "in the supplied testbench."
+        )
+    if any(not isinstance(v, (int, float)) or not isfinite(float(v)) for v in expectations.values()):
+        raise ValueError("Every golden expectation must be a finite numeric value.")
 
     cleaned = _strip_comments(_sanitize_spice_text(raw))
     area_proxy = _estimate_area_from_netlist(cleaned)
@@ -886,7 +984,8 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "continue_reason": "init",
         "fix_attempts": 0,
         "testbench": explicit_tb,
-        "golden_validation_passed": True,
+        "golden_validation_passed": False,
+        "golden_expectations": {str(k).lower(): float(v) for k, v in expectations.items()},
         "area_estimate_um2": area_proxy,
         "area_um2": area_proxy if area_proxy is not None else float("inf"),
         "area_estimate_method": "sum(W*L) proxy; not physical layout area",
@@ -1074,6 +1173,17 @@ def simulation_runner(state: AutoPPA) -> Dict[str, Any]:
         "sim_failed": result["failed"],
         "combined_circuit": result["combined"],
         "testbench": testbench,
+        "golden_validation": _evaluate_golden_measurements(
+            testbench,
+            result["log"],
+            state.get("golden_expectations", {}),
+        ) if not result["failed"] else {"passed": False, "reason": "simulation_failed"},
+        "golden_validation_passed": (
+            not result["failed"]
+            and _evaluate_golden_measurements(
+                testbench, result["log"], state.get("golden_expectations", {})
+            )["passed"]
+        ),
     }
 
 
@@ -1130,7 +1240,12 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
     sim_ok = not state.get("sim_failed", True)
     # Simulation with a user-supplied golden testbench is required. Static
     # connectivity checks are not a functional-equivalence proof.
-    func_ok = bool(state.get("functional_valid", False)) and bool(state.get("golden_validation_passed", False))
+    func_ok = (
+        bool(state.get("functional_valid", False))
+        and bool(state.get("golden_validation_passed", False))
+    )
+    if not state.get("golden_validation_passed", False):
+        reject_reasons_placeholder = None
 
     best_delay = state.get("best_delay", float("inf"))
     best_power = state.get("best_power", float("inf"))
