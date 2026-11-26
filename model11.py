@@ -1325,7 +1325,7 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
             {
                 "best_delay": current_delay,
                 "best_power": current_power,
-                "best_area": current_area,
+                "best_area": current_area if isfinite(float(current_area)) else best_area,
                 "best_netlist": state.get("proposed_netlist", state.get("working_netlist", "")),
                 "best_iteration": state.get("iteration", 0),
                 "working_netlist": state.get("proposed_netlist", state.get("working_netlist", "")),
@@ -1478,8 +1478,10 @@ def final_optimizer(state: AutoPPA) -> Dict[str, Any]:
         "final_area": state.get("best_area"),
         "convergence_score": state.get("cost", 0.0),
         "area_is_physical": False,
-        "area_estimate_um2": state.get("area_estimate_um2"),
-        "area_estimate_method": state.get("area_estimate_method", "unknown"),
+        "area_estimate_um2": (
+            state.get("best_area") if isfinite(float(state.get("best_area", float("inf")))) else None
+        ),
+        "area_estimate_method": "sum(W*L) sizing proxy; not physical layout area",
     }
 
 
