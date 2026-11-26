@@ -845,10 +845,16 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
     if not isinstance(explicit_tb, str) or not explicit_tb.strip():
         raise ValueError(
             "A circuit-specific testbench is required. Supply explicit power rails, "
-            "input stimulus, output load, and measurement directives."
+            "input stimulus, output load, measurements, and a golden expected response."
+        )
+    if not state.get("golden_validation_passed", False):
+        raise ValueError(
+            "Functional-equivalence evidence is required. Set golden_validation_passed=True "
+            "only after comparing the simulation output against a trusted golden response."
         )
 
     cleaned = _strip_comments(_sanitize_spice_text(raw))
+    area_proxy = _estimate_area_from_netlist(cleaned)
     return {
         "netlist_raw": raw,
         "working_netlist": cleaned,
@@ -858,7 +864,7 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "prompt": state.get("prompt", ""),
         "brief_description": state.get("brief_description", ""),
         "opt_objective": state.get("opt_objective", "Balanced PPA"),
-        "max_iterations": int(state.get("max_iterations", 5)),
+        "max_iterations": max(1, int(state.get("max_iterations", 5))),
         "analysis_type": state.get("analysis_type", "Transient"),
         "iteration": 0,
         "history": [],
@@ -880,12 +886,15 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
         "continue_reason": "init",
         "fix_attempts": 0,
         "testbench": explicit_tb,
-        "area_estimate_um2": _estimate_area_from_netlist(cleaned),
+        "golden_validation_passed": True,
+        "area_estimate_um2": area_proxy,
+        "area_um2": area_proxy if area_proxy is not None else float("inf"),
         "area_estimate_method": "sum(W*L) proxy; not physical layout area",
         "area_is_physical": False,
-        "functional_validation_level": "simulation_required",
+        "functional_validation_level": "golden_simulation_required",
         "validation_warnings": [
             "Static topology checks cannot prove logic equivalence.",
+            "Golden-response comparison must be performed for every candidate.",
             "Physical area requires synthesis/layout data; W*L is only a sizing proxy."
         ],
     }
@@ -920,6 +929,8 @@ def functional_validator_node(state: AutoPPA) -> Dict[str, Any]:
         "missing_nodes": result["missing_nodes"],
         "path_exists": result["path_exists"],
         "testbench": testbench,
+        "functional_validation_level": result.get("validation_level", "structural_only"),
+        "validation_warnings": result.get("warnings", []),
     }
 
 
@@ -1024,6 +1035,15 @@ Return ONLY JSON:
         }
 
     testbench = state.get("testbench", "")
+    if not testbench.strip():
+        return {
+            "proposed_netlist": current_netlist,
+            "reasoning": "No explicit testbench available; candidate rejected.",
+            "llm_status": "blocked",
+            "llm_error": "Missing circuit-specific testbench",
+            "candidate_unchanged": True,
+            "fix_attempts": 0,
+        }
     return {
         "proposed_netlist": candidate,
         "testbench": testbench,
@@ -1035,6 +1055,8 @@ Return ONLY JSON:
         "llm_error": "",
         "candidate_unchanged": False,
         "area_estimate_um2": _estimate_area_from_netlist(candidate),
+        "area_um2": (_estimate_area_from_netlist(candidate)
+                     if _estimate_area_from_netlist(candidate) is not None else float("inf")),
         "area_estimate_method": "sum(W*L) proxy; not physical layout area",
         "area_is_physical": False,
     }
@@ -1086,14 +1108,8 @@ def llm_parse_results(state: AutoPPA) -> Dict[str, Any]:
 
     log = state.get("ngspice_log", "")
     delay, power = _parse_measures_from_log(log)
-    if delay == float("inf") and power == float("inf"):
-        raw = _call_llm(
-            [{"role": "system", "content": PARSE_SYSTEM}, {"role": "user", "content": log[:4500]}],
-            max_tokens=600,
-        )
-        parsed = _extract_json(raw) or {}
-        delay = float(parsed.get("delay_ps", float("inf")) or float("inf"))
-        power = float(parsed.get("power_uw", float("inf")) or float("inf"))
+    # Do not use an LLM to infer missing measurements: measured PPA must be
+    # reproducible from the simulator output and explicit .measure directives.
 
     area = _estimate_area_from_netlist(state.get("proposed_netlist", ""))
     return {
