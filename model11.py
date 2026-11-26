@@ -951,7 +951,7 @@ def input_loader(state: AutoPPA) -> Dict[str, Any]:
             "Every golden_expectations key must have a matching .measure named golden_* "
             "in the supplied testbench."
         )
-    if any(not isinstance(v, (int, float)) or not isfinite(float(v)) for v in expectations.values()):
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not isfinite(float(v)) for v in expectations.values()):
         raise ValueError("Every golden expectation must be a finite numeric value.")
 
     cleaned = _strip_comments(_sanitize_spice_text(raw))
@@ -1119,6 +1119,8 @@ Return ONLY JSON:
             "llm_status": "error",
             "llm_error": "Empty response or missing proposed_netlist",
             "candidate_unchanged": True,
+            "sim_failed": True,
+            "ngspice_log": "LLM generation failed; NGSpice was not run for this candidate.",
             "fix_attempts": 0,
         }
 
@@ -1133,6 +1135,8 @@ Return ONLY JSON:
             "llm_status": "no_change",
             "llm_error": "Candidate is empty or unchanged",
             "candidate_unchanged": True,
+            "sim_failed": True,
+            "ngspice_log": "LLM returned an unchanged candidate; NGSpice was not run.",
             "fix_attempts": 0,
         }
 
@@ -1144,6 +1148,8 @@ Return ONLY JSON:
             "llm_status": "blocked",
             "llm_error": "Missing circuit-specific testbench",
             "candidate_unchanged": True,
+            "sim_failed": True,
+            "ngspice_log": "Candidate blocked because the circuit-specific testbench is missing.",
             "fix_attempts": 0,
         }
     return {
@@ -1258,6 +1264,10 @@ def acceptance_checker(state: AutoPPA) -> Dict[str, Any]:
         reject_reasons.append("functional validation failed")
     if state.get("functional_errors"):
         reject_reasons.append(f"functional errors: {state.get('functional_errors')}")
+    if state.get("llm_status") in {"error", "no_change", "blocked"}:
+        reject_reasons.append(
+            f"LLM candidate generation {state.get('llm_status')}: {state.get('llm_error', '')}"
+        )
 
     improved_any = False
     if sim_ok and func_ok:
@@ -1420,6 +1430,9 @@ def history_logger(state: AutoPPA) -> Dict[str, Any]:
         "cost": state.get("cost"),
         "improvement": improv,
         "reasoning": state.get("reasoning", ""),
+        "llm_status": state.get("llm_status", "not_applicable"),
+        "llm_error": state.get("llm_error", ""),
+        "golden_validation_passed": state.get("golden_validation_passed", False),
         "fixes": state.get("applied_fixes", []),
     }
     history.append(entry)
@@ -1477,10 +1490,18 @@ def route_after_functional(state: AutoPPA) -> str:
 def route_after_simulation(state: AutoPPA) -> str:
     if state.get("sim_failed", True):
         fix_attempts = int(state.get("fix_attempts", 0))
-        if state.get("sim_error_pattern") in {"invalid_measure_node", "convergence", "missing_model"} and fix_attempts < 2:
+        # Only convergence has a conservative deterministic repair. Missing
+        # models and invalid measurements require user/PDK corrections.
+        if state.get("sim_error_pattern") == "convergence" and fix_attempts < 2:
             return "fixable"
         return "failed"
     return "success"
+
+
+def route_after_generation(state: AutoPPA) -> str:
+    if state.get("candidate_unchanged", False) and int(state.get("iteration", 0)) > 0:
+        return "failed"
+    return "simulate"
 
 
 def route_convergence(state: AutoPPA) -> str:
@@ -1515,7 +1536,11 @@ graph.add_conditional_edges(
 )
 
 graph.add_edge("electrical_validator", "llm_design_generator")
-graph.add_edge("llm_design_generator", "simulation_runner")
+graph.add_conditional_edges(
+    "llm_design_generator",
+    route_after_generation,
+    {"simulate": "simulation_runner", "failed": "llm_parse_results"},
+)
 graph.add_edge("simulation_runner", "error_analyzer")
 
 graph.add_conditional_edges(
